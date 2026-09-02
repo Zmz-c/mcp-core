@@ -1,4 +1,4 @@
-package burp.vaycore.mcp;
+package burp.zm.mcp;
 
 import java.util.LinkedHashMap;
 import java.util.List;
@@ -16,7 +16,7 @@ import java.util.concurrent.CountDownLatch;
 public final class McpStandaloneMain {
 
     private static final String DEFAULT_NAME = "mcp-core-standalone";
-    private static final String DEFAULT_VERSION = "1.1.0";
+    private static final String DEFAULT_VERSION = "1.1.1";
 
     private McpStandaloneMain() {
     }

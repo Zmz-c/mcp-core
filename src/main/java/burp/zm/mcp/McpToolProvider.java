@@ -1,4 +1,4 @@
-package burp.vaycore.mcp;
+package burp.zm.mcp;
 
 import java.util.List;
 import java.util.Map;

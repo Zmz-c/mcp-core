@@ -1,4 +1,4 @@
-package burp.vaycore.mcp;
+package burp.zm.mcp;
 
 import com.google.gson.Gson;
 import org.junit.After;

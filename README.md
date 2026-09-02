@@ -16,7 +16,7 @@ McpToolProvider provider = new McpToolProvider() {
     }
 };
 
-McpServer server = new McpServer(provider, "my-plugin-mcp", "1.1.0");
+McpServer server = new McpServer(provider, "my-plugin-mcp", "1.1.1");
 server.start();
 // server.getEndpoint() -> http://127.0.0.1:<port>/mcp
 ```
@@ -43,10 +43,10 @@ Build the executable package from the repository root:
 .\mvnw.cmd package
 ```
 
-The output is `target/mcp-core-1.1.0-standalone.jar`. Run it with Java 21:
+The output is `target/mcp-core-1.1.1-standalone.jar`. Run it with Java 21:
 
 ```powershell
-java -jar target/mcp-core-1.1.0-standalone.jar
+java -jar target/mcp-core-1.1.1-standalone.jar
 ```
 
 The launcher uses the shared `127.0.0.1:8765` host port and exposes two
@@ -58,15 +58,16 @@ constructor. To load one, put its jar beside the standalone package and launch
 with an explicit class path, for example on Windows:
 
 ```powershell
-java -cp "custom-provider.jar;target/mcp-core-1.1.0-standalone.jar" `
-  burp.vaycore.mcp.McpStandaloneMain --provider-class com.example.MyProvider
+java -cp "custom-provider.jar;target/mcp-core-1.1.1-standalone.jar" `
+  burp.zm.mcp.McpStandaloneMain --provider-class com.example.MyProvider
 ```
 
 On Linux/macOS, use `:` instead of `;` in the class path.
 
 ## Offline Swagger UI
 
-The standalone server bundles Swagger UI, its CSS/JavaScript assets, and the
+The public Java API package is `burp.zm.mcp` (the previous `burp.vaycore.mcp`
+package is no longer used). The standalone server bundles Swagger UI, its CSS/JavaScript assets, and the
 OpenAPI document. No CDN, network connection, or external browser extension is
 needed. After starting the server, open the following local URL in a browser:
 
