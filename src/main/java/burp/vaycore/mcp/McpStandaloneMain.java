@@ -16,7 +16,7 @@ import java.util.concurrent.CountDownLatch;
 public final class McpStandaloneMain {
 
     private static final String DEFAULT_NAME = "mcp-core-standalone";
-    private static final String DEFAULT_VERSION = "1.0.1";
+    private static final String DEFAULT_VERSION = "1.1.0";
 
     private McpStandaloneMain() {
     }
@@ -42,7 +42,11 @@ public final class McpStandaloneMain {
                 : new McpServer(provider, options.name(), options.version(), options.port());
         Runtime.getRuntime().addShutdownHook(new Thread(server::stop, "MCP-server-shutdown"));
         server.start();
-        System.out.println("MCP server listening on " + server.getEndpoint());
+        System.out.println("MCP provider started as " + server.getRole().name().toLowerCase()
+                + " on " + server.getEndpoint());
+        if (server.getRole() == McpServer.Role.CLIENT) {
+            System.out.println("Provider registered with the existing shared host on port " + server.getEndpoint());
+        }
         System.out.println("Health check: " + server.getEndpoint().replace("/mcp", "/health"));
         System.out.println("Press Ctrl+C to stop.");
         new CountDownLatch(1).await();
@@ -60,7 +64,7 @@ public final class McpStandaloneMain {
     private static void printUsage() {
         System.out.println("Usage: java -jar mcp-core-<version>-standalone.jar [options]");
         System.out.println("Options:");
-        System.out.println("  --port <number>             Bind an exact port (default: 8765-8785)");
+        System.out.println("  --port <number>             Bind an exact port (default shared host port: 8765)");
         System.out.println("  --name <name>               Server name (default: " + DEFAULT_NAME + ")");
         System.out.println("  --version <version>         Server version (default: " + DEFAULT_VERSION + ")");
         System.out.println("  --provider-class <class>    Load a provider with a public no-arg constructor");

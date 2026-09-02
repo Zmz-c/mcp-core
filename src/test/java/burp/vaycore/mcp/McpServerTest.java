@@ -9,6 +9,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.net.Socket;
+import java.net.ServerSocket;
 import java.net.URI;
 import java.nio.charset.StandardCharsets;
 import java.util.List;
@@ -159,8 +160,71 @@ public class McpServerTest {
         assertEquals(400, traversal.status());
     }
 
+    @Test
+    public void joinsExistingHostAndForwardsProviderCalls() throws Exception {
+        int sharedPort;
+        try (ServerSocket probe = new ServerSocket(0)) {
+            sharedPort = probe.getLocalPort();
+        }
+        McpServer host = new McpServer(new McpToolProvider() {
+            @Override
+            public List<McpTool> listTools() {
+                return List.of(new McpTool("host.status", "Host status", Map.of("type", "object")));
+            }
+
+            @Override
+            public Object callTool(String name, Map<String, Object> arguments) {
+                return Map.of("owner", "host");
+            }
+        }, "host", "1.0.0", sharedPort);
+        McpServer client = new McpServer(new McpToolProvider() {
+            @Override
+            public List<McpTool> listTools() {
+                return List.of(new McpTool("remote.echo", "Remote echo", Map.of(
+                        "type", "object", "properties", Map.of("value", Map.of("type", "string")))));
+            }
+
+            @Override
+            public Object callTool(String name, Map<String, Object> arguments) {
+                return Map.of("owner", "client", "arguments", arguments);
+            }
+        }, "client", "1.0.0", sharedPort);
+        host.start();
+        try {
+            client.start();
+            assertEquals(McpServer.Role.HOST, host.getRole());
+            assertEquals(McpServer.Role.CLIENT, client.getRole());
+            long deadline = System.currentTimeMillis() + 2000;
+            HttpResult list;
+            do {
+                list = requestAt(URI.create(host.getEndpoint()), "POST", "/mcp",
+                        Map.of("Content-Type", "application/json"),
+                        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\",\"params\":{}}");
+                if (list.body().contains("remote.echo")) {
+                    break;
+                }
+                Thread.sleep(20);
+            } while (System.currentTimeMillis() < deadline);
+            assertTrue(list.body().contains("host.status"));
+            assertTrue(list.body().contains("remote.echo"));
+
+            HttpResult call = requestAt(URI.create(host.getEndpoint()), "POST", "/mcp",
+                    Map.of("Content-Type", "application/json"),
+                    "{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/call\","
+                            + "\"params\":{\"name\":\"remote.echo\",\"arguments\":{\"value\":\"ok\"}}}");
+            assertTrue(call.body().contains("\"owner\":\"client\""));
+        } finally {
+            client.stop();
+            host.stop();
+        }
+    }
+
     private HttpResult request(String method, String path, Map<String, String> headers, String body) throws Exception {
-        URI endpoint = URI.create(server.getEndpoint());
+        return requestAt(URI.create(server.getEndpoint()), method, path, headers, body);
+    }
+
+    private HttpResult requestAt(URI endpoint, String method, String path,
+                                 Map<String, String> headers, String body) throws Exception {
         try (Socket socket = new Socket(endpoint.getHost(), endpoint.getPort())) {
             byte[] payload = body.getBytes(StandardCharsets.UTF_8);
             StringBuilder request = new StringBuilder(method).append(' ').append(path)

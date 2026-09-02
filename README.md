@@ -16,7 +16,7 @@ McpToolProvider provider = new McpToolProvider() {
     }
 };
 
-McpServer server = new McpServer(provider, "my-plugin-mcp", "1.0.0");
+McpServer server = new McpServer(provider, "my-plugin-mcp", "1.1.0");
 server.start();
 // server.getEndpoint() -> http://127.0.0.1:<port>/mcp
 ```
@@ -43,21 +43,22 @@ Build the executable package from the repository root:
 .\mvnw.cmd package
 ```
 
-The output is `target/mcp-core-1.0.1-standalone.jar`. Run it with Java 21:
+The output is `target/mcp-core-1.1.0-standalone.jar`. Run it with Java 21:
 
 ```powershell
-java -jar target/mcp-core-1.0.1-standalone.jar
+java -jar target/mcp-core-1.1.0-standalone.jar
 ```
 
-The launcher binds to `127.0.0.1`, tries ports `8765` through `8785`, and exposes
-two diagnostic tools (`standalone.status` and `standalone.echo`). Use
+The launcher uses the shared `127.0.0.1:8765` host port and exposes two
+diagnostic tools (`standalone.status` and `standalone.echo`). If another host
+already owns the port, it registers this provider and joins that host. Use
 `--port`, `--name`, `--version`, or `--provider-class` to customize it. A custom
 provider class must implement `McpToolProvider` and have a public no-argument
 constructor. To load one, put its jar beside the standalone package and launch
 with an explicit class path, for example on Windows:
 
 ```powershell
-java -cp "custom-provider.jar;target/mcp-core-1.0.1-standalone.jar" `
+java -cp "custom-provider.jar;target/mcp-core-1.1.0-standalone.jar" `
   burp.vaycore.mcp.McpStandaloneMain --provider-class com.example.MyProvider
 ```
 
@@ -70,10 +71,32 @@ OpenAPI document. No CDN, network connection, or external browser extension is
 needed. After starting the server, open the following local URL in a browser:
 
 ```text
-http://127.0.0.1:<port>/docs/
+http://127.0.0.1:8765/docs/
 ```
 
 The page loads the specification from `/docs/openapi.yaml` and lets you try
-the health and MCP endpoints against the running local server. The exact port
-is printed at startup (or is the value passed with `--port`). The raw OpenAPI
+the health and MCP endpoints against the running local server. If `--port` is
+used for an isolated instance, replace `8765` with that explicit port. The raw OpenAPI
 3.1 document is also available as `openapi.yaml` in the repository.
+
+## Shared single-port host
+
+Every default `McpServer` uses the fixed loopback port `8765`. The first plugin
+that binds it becomes the host. If another plugin starts later, it registers
+its `McpToolProvider` through the host's loopback registration endpoint and
+opens a heartbeat-backed provider channel. The host aggregates all registered
+tools in `tools/list` and forwards `tools/call` over that channel.
+
+This makes the MCP client configuration stable:
+
+```text
+http://127.0.0.1:8765/mcp
+```
+
+Provider names and tool names must be unique; use a namespace such as
+`my-plugin.status` to avoid collisions. Providers are removed on clean stop or
+after a 45-second lease expires. If the host disappears, a connected provider
+automatically attempts to claim `8765` and become the new host, then accepts
+new registrations. The internal registration endpoints are
+`/__mcp/providers/register` and `/__mcp/providers/unregister`; they are
+loopback-only and are documented in the bundled OpenAPI specification.

@@ -3,23 +3,33 @@ package burp.vaycore.mcp;
 import com.google.gson.*;
 
 import java.io.ByteArrayOutputStream;
+import java.io.BufferedInputStream;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.io.BufferedWriter;
+import java.io.OutputStreamWriter;
 import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.net.URI;
+import java.net.HttpURLConnection;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
 import java.util.*;
 import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicLong;
 
 public class McpServer {
 
     public static final int DEFAULT_PORT = 8765;
+    /** Retained for source compatibility; default constructors use only {@link #DEFAULT_PORT}. */
     public static final int DEFAULT_PORT_RANGE = 20;
     private static final String JSON_RPC_VERSION = "2.0";
     private static final String DEFAULT_SERVER_NAME = "burp-mcp";
@@ -35,17 +45,35 @@ public class McpServer {
     private static final int MAX_SESSIONS = 128;
     private static final int MAX_WORKER_THREADS = 16;
     private static final long SESSION_IDLE_TIMEOUT_MILLIS = 30 * 60 * 1000L;
+    private static final String PROVIDER_REGISTER_PATH = "/__mcp/providers/register";
+    private static final String PROVIDER_UNREGISTER_PATH = "/__mcp/providers/unregister";
+    private static final String PROVIDER_PREFACE = "MCP-PROVIDER/1 ";
+    private static final int MAX_PROVIDER_FRAME_BYTES = 4 * 1024 * 1024;
+    private static final long PROVIDER_LEASE_MILLIS = 45_000L;
+    private static final long PROVIDER_HEARTBEAT_MILLIS = 10_000L;
+    private static final long PROVIDER_CALL_TIMEOUT_MILLIS = 30_000L;
+    private static final int PROVIDER_CONNECT_TIMEOUT_MILLIS = 2_000;
+    private static final String PROVIDER_ID_PATTERN = "[A-Za-z0-9._~-]{1,128}";
 
     private final McpToolProvider toolProvider;
     private final String serverName;
     private final String serverVersion;
     private final int firstPort;
     private final int lastPort;
+    private final boolean joinOnBindFailure;
+    private final String providerId = UUID.randomUUID().toString();
     private ServerSocket serverSocket;
     private ExecutorService executor;
     private Thread acceptThread;
     private volatile boolean running;
     private int port;
+    private volatile Role role;
+    private volatile Socket providerSocket;
+    private volatile BufferedWriter providerWriter;
+    private volatile long lastProviderHeartbeatAck = System.currentTimeMillis();
+    private ScheduledExecutorService providerMaintenance;
+    private final AtomicLong providerRequestSequence = new AtomicLong();
+    private final Map<String, RemoteProvider> remoteProviders = new ConcurrentHashMap<>();
     private final Map<String, Session> sessions = new ConcurrentHashMap<>();
 
     public McpServer(McpToolProvider toolProvider) {
@@ -57,7 +85,7 @@ public class McpServer {
     }
 
     public McpServer(McpToolProvider toolProvider, String serverName, String serverVersion) {
-        this(toolProvider, serverName, serverVersion, DEFAULT_PORT, DEFAULT_PORT + DEFAULT_PORT_RANGE);
+        this(toolProvider, serverName, serverVersion, DEFAULT_PORT, DEFAULT_PORT);
     }
 
     public McpServer(McpToolProvider toolProvider, String serverName, String serverVersion, int port) {
@@ -78,6 +106,25 @@ public class McpServer {
                 ? DEFAULT_SERVER_VERSION : serverVersion;
         this.firstPort = firstPort;
         this.lastPort = lastPort;
+        this.joinOnBindFailure = firstPort == lastPort && firstPort > 0;
+    }
+
+    /** The role of this instance in the shared single-port transport. */
+    public enum Role { HOST, CLIENT }
+
+    /** Returns HOST when this instance owns the shared port, or CLIENT when registered with another host. */
+    public Role getRole() {
+        return role;
+    }
+
+    /** Stable id used by a client provider registration. */
+    public String getProviderId() {
+        return providerId;
+    }
+
+    /** Number of local plus remotely registered providers visible to this host. */
+    public int getProviderCount() {
+        return 1 + remoteProviders.size();
     }
 
     private static HttpRequest readRequest(InputStream input) throws IOException {
@@ -289,7 +336,7 @@ public class McpServer {
     }
 
     public synchronized void start() throws IOException {
-        if (serverSocket != null) {
+        if (serverSocket != null || role != null) {
             return;
         }
         IOException lastException = null;
@@ -301,14 +348,25 @@ public class McpServer {
                 socket.bind(new InetSocketAddress(loopback, candidate), 50);
                 serverSocket = socket;
                 port = socket.getLocalPort();
+                role = Role.HOST;
                 break;
             } catch (IOException e) {
                 lastException = e;
             }
         }
         if (serverSocket == null) {
+            if (joinOnBindFailure && tryJoinExistingHost()) {
+                role = Role.CLIENT;
+                port = firstPort;
+                startProviderMaintenance();
+                return;
+            }
             throw lastException == null ? new IOException("MCP server failed to bind") : lastException;
         }
+        startHostRuntime();
+    }
+
+    private void startHostRuntime() {
         executor = Executors.newFixedThreadPool(MAX_WORKER_THREADS, r -> {
             Thread thread = new Thread(r, "MCP-server");
             thread.setDaemon(true);
@@ -318,11 +376,22 @@ public class McpServer {
         acceptThread = new Thread(this::acceptLoop, "MCP-server-accept");
         acceptThread.setDaemon(true);
         acceptThread.start();
+        if (providerMaintenance == null || providerMaintenance.isShutdown()) {
+            startProviderMaintenance();
+        }
     }
 
     public synchronized void stop() {
         running = false;
+        if (role == Role.CLIENT) {
+            closeProviderChannel();
+            unregisterFromHost();
+        }
         sessions.clear();
+        for (RemoteProvider provider : remoteProviders.values()) {
+            provider.close();
+        }
+        remoteProviders.clear();
         if (serverSocket != null) {
             try {
                 serverSocket.close();
@@ -339,13 +408,78 @@ public class McpServer {
             executor.shutdownNow();
             executor = null;
         }
+        if (providerMaintenance != null) {
+            providerMaintenance.shutdownNow();
+            providerMaintenance = null;
+        }
+        providerSocket = null;
+        providerWriter = null;
+        role = null;
     }
 
     public String getEndpoint() {
-        if (port <= 0) {
+        if (port <= 0 || role == null) {
             return "";
         }
         return "http://127.0.0.1:" + port + "/mcp";
+    }
+
+    private void startProviderMaintenance() {
+        providerMaintenance = Executors.newSingleThreadScheduledExecutor(r -> {
+            Thread thread = new Thread(r, "MCP-provider-maintenance");
+            thread.setDaemon(true);
+            return thread;
+        });
+        providerMaintenance.scheduleAtFixedRate(this::maintainProviderConnection,
+                PROVIDER_HEARTBEAT_MILLIS, PROVIDER_HEARTBEAT_MILLIS, TimeUnit.MILLISECONDS);
+    }
+
+    private void maintainProviderConnection() {
+        try {
+            if (role == Role.HOST) {
+                long now = System.currentTimeMillis();
+                remoteProviders.values().removeIf(provider -> {
+                    if (now - provider.lastHeartbeat > PROVIDER_LEASE_MILLIS) {
+                        provider.close();
+                        return true;
+                    }
+                    return false;
+                });
+            } else if (role == Role.CLIENT) {
+                if (isProviderChannelAlive()) {
+                    sendProviderFrame(mapOf("type", "heartbeat"));
+                } else {
+                    synchronized (this) {
+                        if (role != Role.CLIENT || isProviderChannelAlive()) {
+                            return;
+                        }
+                        if (tryBecomeHost()) {
+                            role = Role.HOST;
+                            startHostRuntime();
+                        } else {
+                            closeProviderChannel();
+                            tryJoinExistingHost();
+                        }
+                    }
+                }
+            }
+        } catch (Exception ignored) {
+            // Maintenance is best-effort; the next tick retries registration or cleanup.
+        }
+    }
+
+    private boolean tryBecomeHost() {
+        try {
+            InetAddress loopback = InetAddress.getByName("127.0.0.1");
+            ServerSocket socket = new ServerSocket();
+            socket.setReuseAddress(true);
+            socket.bind(new InetSocketAddress(loopback, firstPort), 50);
+            serverSocket = socket;
+            port = socket.getLocalPort();
+            return true;
+        } catch (IOException ignored) {
+            return false;
+        }
     }
 
     private void acceptLoop() {
@@ -367,11 +501,17 @@ public class McpServer {
     }
 
     private void handleSocket(Socket socket) {
-        try (Socket closeableSocket = socket) {
-            closeableSocket.setSoTimeout(30000);
+        boolean handedToProviderChannel = false;
+        try {
+            socket.setSoTimeout(30000);
+            BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+            if (looksLikeProviderPreface(input)) {
+                handedToProviderChannel = handleProviderChannel(socket, input);
+                return;
+            }
             HttpResponse response;
             try {
-                HttpRequest request = readRequest(closeableSocket.getInputStream());
+                HttpRequest request = readRequest(input);
                 response = handleHttpRequest(request);
                 applyCorsHeaders(request, response);
             } catch (HttpParseException e) {
@@ -381,9 +521,227 @@ public class McpServer {
             } catch (Exception e) {
                 response = jsonResponse(500, mapOf("error", "server error"));
             }
-            writeResponse(closeableSocket.getOutputStream(), response);
+            writeResponse(socket.getOutputStream(), response);
         } catch (Exception ignored) {
             // The peer may close before an error response can be written.
+        } finally {
+            if (!handedToProviderChannel) {
+                try {
+                    socket.close();
+                } catch (IOException ignored) {
+                    // ignored
+                }
+            }
+        }
+    }
+
+    private static boolean looksLikeProviderPreface(BufferedInputStream input) throws IOException {
+        input.mark(PROVIDER_PREFACE.length());
+        int first = input.read();
+        if (first != PROVIDER_PREFACE.charAt(0)) {
+            input.reset();
+            return false;
+        }
+        byte[] rest = input.readNBytes(PROVIDER_PREFACE.length() - 1);
+        byte[] probe = new byte[1 + rest.length];
+        probe[0] = (byte) first;
+        System.arraycopy(rest, 0, probe, 1, rest.length);
+        input.reset();
+        return probe.length == PROVIDER_PREFACE.length()
+                && Arrays.equals(probe, PROVIDER_PREFACE.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private boolean handleProviderChannel(Socket socket, BufferedInputStream input) throws IOException {
+        socket.setSoTimeout(0);
+        String preface = readProviderLine(input, 512);
+        if (preface == null || !preface.startsWith(PROVIDER_PREFACE)) {
+            return false;
+        }
+        String[] parts = preface.substring(PROVIDER_PREFACE.length()).trim().split("\\s+", 2);
+        if (parts.length != 2) {
+            return false;
+        }
+        RemoteProvider provider = remoteProviders.get(parts[0]);
+        if (provider == null || !constantTimeEquals(provider.channelToken, parts[1])) {
+            return false;
+        }
+        provider.attach(socket, input);
+        return true;
+    }
+
+    private static String readProviderLine(InputStream input, int maxBytes) throws IOException {
+        ByteArrayOutputStream bytes = new ByteArrayOutputStream();
+        while (bytes.size() < maxBytes) {
+            int value = input.read();
+            if (value < 0) {
+                return bytes.size() == 0 ? null : bytes.toString(StandardCharsets.UTF_8);
+            }
+            if (value == '\n') {
+                return bytes.toString(StandardCharsets.UTF_8).replaceFirst("\\r$", "");
+            }
+            bytes.write(value);
+        }
+        throw new IOException("provider preface too large");
+    }
+
+    private static boolean constantTimeEquals(String left, String right) {
+        return left != null && right != null
+                && java.security.MessageDigest.isEqual(left.getBytes(StandardCharsets.US_ASCII),
+                right.getBytes(StandardCharsets.US_ASCII));
+    }
+
+    private boolean tryJoinExistingHost() {
+        try {
+            URL url = new URL("http://127.0.0.1:" + firstPort + PROVIDER_REGISTER_PATH);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(PROVIDER_CONNECT_TIMEOUT_MILLIS);
+            connection.setReadTimeout(PROVIDER_CONNECT_TIMEOUT_MILLIS);
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json");
+            Map<String, Object> registration = mapOf("providerId", providerId, "name", serverName,
+                    "version", serverVersion, "tools", toolProvider.listTools());
+            byte[] body = GSON.toJson(registration).getBytes(StandardCharsets.UTF_8);
+            connection.setFixedLengthStreamingMode(body.length);
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(body);
+            }
+            if (connection.getResponseCode() != 200) {
+                connection.disconnect();
+                return false;
+            }
+            JsonElement response = JsonParser.parseString(new String(connection.getInputStream().readAllBytes(),
+                    StandardCharsets.UTF_8));
+            connection.disconnect();
+            if (!response.isJsonObject()) {
+                return false;
+            }
+            String token = stringValue(response.getAsJsonObject().get("channelToken"));
+            if (token == null || token.isBlank()) {
+                return false;
+            }
+            Socket socket = new Socket();
+            socket.connect(new InetSocketAddress("127.0.0.1", firstPort), PROVIDER_CONNECT_TIMEOUT_MILLIS);
+            socket.setTcpNoDelay(true);
+            BufferedWriter writer = new BufferedWriter(new OutputStreamWriter(socket.getOutputStream(), StandardCharsets.UTF_8));
+            writer.write(PROVIDER_PREFACE + providerId + " " + token + "\n");
+            writer.flush();
+            providerSocket = socket;
+            providerWriter = writer;
+            lastProviderHeartbeatAck = System.currentTimeMillis();
+            Thread reader = new Thread(() -> providerClientReadLoop(socket), "MCP-provider-client");
+            reader.setDaemon(true);
+            reader.start();
+            return true;
+        } catch (Exception ignored) {
+            closeProviderChannel();
+            return false;
+        }
+    }
+
+    private void providerClientReadLoop(Socket socket) {
+        try {
+            BufferedInputStream input = new BufferedInputStream(socket.getInputStream());
+            String frame;
+            while ((frame = readProviderLine(input, MAX_PROVIDER_FRAME_BYTES)) != null) {
+                JsonElement element = JsonParser.parseString(frame);
+                if (!element.isJsonObject()) {
+                    continue;
+                }
+                JsonObject object = element.getAsJsonObject();
+                String type = stringValue(object.get("type"));
+                if ("call".equals(type)) {
+                    handleProviderCall(object);
+                } else if ("heartbeat_ack".equals(type) || "pong".equals(type)) {
+                    lastProviderHeartbeatAck = System.currentTimeMillis();
+                    // Keep the channel alive; no action is required.
+                }
+            }
+        } catch (Exception ignored) {
+            // The maintenance loop will reconnect or take over the host port.
+        } finally {
+            if (providerSocket == socket) {
+                closeProviderChannel();
+            }
+        }
+    }
+
+    private void handleProviderCall(JsonObject object) {
+        String requestId = stringValue(object.get("requestId"));
+        String name = stringValue(object.get("name"));
+        Map<String, Object> arguments = new LinkedHashMap<>();
+        if (object.has("arguments") && object.get("arguments").isJsonObject()) {
+            Map<?, ?> parsed = GSON.fromJson(object.get("arguments"), Map.class);
+            if (parsed != null) {
+                parsed.forEach((key, value) -> arguments.put(String.valueOf(key), value));
+            }
+        }
+        if (requestId == null || name == null) {
+            return;
+        }
+        try {
+            Object result = toolProvider.callTool(name, arguments);
+            sendProviderFrame(mapOf("type", "result", "requestId", requestId, "result", result));
+        } catch (Exception error) {
+            sendProviderFrame(mapOf("type", "error", "requestId", requestId,
+                    "error", safeToolErrorMessage(error)));
+        }
+    }
+
+    private void sendProviderFrame(Map<String, Object> frame) {
+        BufferedWriter writer = providerWriter;
+        if (writer == null) {
+            return;
+        }
+        synchronized (writer) {
+            try {
+                writer.write(GSON.toJson(frame));
+                writer.write('\n');
+                writer.flush();
+            } catch (IOException ignored) {
+                closeProviderChannel();
+            }
+        }
+    }
+
+    private boolean isProviderChannelAlive() {
+        Socket socket = providerSocket;
+        return socket != null && socket.isConnected() && !socket.isClosed()
+                && System.currentTimeMillis() - lastProviderHeartbeatAck <= PROVIDER_LEASE_MILLIS;
+    }
+
+    private void closeProviderChannel() {
+        Socket socket = providerSocket;
+        providerSocket = null;
+        providerWriter = null;
+        lastProviderHeartbeatAck = 0;
+        if (socket != null) {
+            try {
+                socket.close();
+            } catch (IOException ignored) {
+                // ignored
+            }
+        }
+    }
+
+    private void unregisterFromHost() {
+        try {
+            URL url = new URL("http://127.0.0.1:" + firstPort + PROVIDER_UNREGISTER_PATH);
+            HttpURLConnection connection = (HttpURLConnection) url.openConnection();
+            connection.setConnectTimeout(PROVIDER_CONNECT_TIMEOUT_MILLIS);
+            connection.setReadTimeout(PROVIDER_CONNECT_TIMEOUT_MILLIS);
+            connection.setRequestMethod("POST");
+            connection.setDoOutput(true);
+            connection.setRequestProperty("Content-Type", "application/json");
+            byte[] body = GSON.toJson(mapOf("providerId", providerId)).getBytes(StandardCharsets.UTF_8);
+            connection.setFixedLengthStreamingMode(body.length);
+            try (OutputStream output = connection.getOutputStream()) {
+                output.write(body);
+            }
+            connection.getResponseCode();
+            connection.disconnect();
+        } catch (Exception ignored) {
+            // Host may already be gone.
         }
     }
 
@@ -396,6 +754,12 @@ public class McpServer {
         }
         if ("/health".equals(path)) {
             return handleHealth(request);
+        }
+        if (PROVIDER_REGISTER_PATH.equals(path)) {
+            return handleProviderRegister(request);
+        }
+        if (PROVIDER_UNREGISTER_PATH.equals(path)) {
+            return handleProviderUnregister(request);
         }
         if ("/docs".equals(path) || "/docs/".equals(path) || path.startsWith("/docs/")) {
             return handleDocs(request, path);
@@ -413,7 +777,88 @@ public class McpServer {
         if (!"GET".equalsIgnoreCase(request.method())) {
             return jsonResponse(405, mapOf("error", "method not allowed"));
         }
-        return jsonResponse(200, mapOf("status", "ok", "endpoint", getEndpoint()));
+        return jsonResponse(200, mapOf("status", "ok", "endpoint", getEndpoint(),
+                "role", role == null ? "stopped" : role.name().toLowerCase(Locale.ROOT),
+                "providerId", providerId, "providers", getProviderCount()));
+    }
+
+    private HttpResponse handleProviderRegister(HttpRequest request) {
+        if (role != Role.HOST) {
+            return jsonResponse(503, mapOf("error", "MCP host is not available"));
+        }
+        if (!isAllowedOrigin(request.headers().get("origin"))) {
+            return jsonResponse(403, mapOf("error", "origin not allowed"));
+        }
+        if (!"POST".equalsIgnoreCase(request.method())) {
+            HttpResponse response = jsonResponse(405, mapOf("error", "method not allowed"));
+            response.headers().put("Allow", "POST");
+            return response;
+        }
+        try {
+            JsonElement root = JsonParser.parseString(request.body());
+            if (!root.isJsonObject()) {
+                return jsonResponse(400, mapOf("error", "registration body must be an object"));
+            }
+            JsonObject object = root.getAsJsonObject();
+            String id = stringValue(object.get("providerId"));
+            String name = stringValue(object.get("name"));
+            String version = stringValue(object.get("version"));
+            JsonElement toolsValue = object.get("tools");
+            JsonArray toolsElement = toolsValue != null && toolsValue.isJsonArray()
+                    ? toolsValue.getAsJsonArray() : null;
+            if (id == null || !id.matches(PROVIDER_ID_PATTERN) || name == null || name.isBlank()
+                    || version == null || version.isBlank() || toolsElement == null) {
+                return jsonResponse(400, mapOf("error", "providerId, name, version and tools are required"));
+            }
+            List<McpTool> tools = new ArrayList<>();
+            Set<String> names = new HashSet<>();
+            for (JsonElement toolElement : toolsElement) {
+                McpTool tool = GSON.fromJson(toolElement, McpTool.class);
+                if (tool == null || tool.getName() == null || tool.getName().isBlank()
+                        || !names.add(tool.getName()) || findTool(tool.getName()) != null) {
+                    return jsonResponse(409, mapOf("error", "provider tool name is missing or already registered"));
+                }
+                tools.add(tool);
+            }
+            RemoteProvider provider = new RemoteProvider(id, name, version, tools, UUID.randomUUID().toString());
+            RemoteProvider previous = remoteProviders.put(id, provider);
+            if (previous != null) {
+                previous.close();
+            }
+            return jsonResponse(200, mapOf("status", "registered", "providerId", id,
+                    "channelToken", provider.channelToken, "leaseSeconds", PROVIDER_LEASE_MILLIS / 1000,
+                    "protocol", "mcp-provider/1"));
+        } catch (JsonParseException | IllegalStateException | UnsupportedOperationException e) {
+            return jsonResponse(400, mapOf("error", "invalid registration body"));
+        }
+    }
+
+    private HttpResponse handleProviderUnregister(HttpRequest request) {
+        if (role != Role.HOST) {
+            return jsonResponse(503, mapOf("error", "MCP host is not available"));
+        }
+        if (!isAllowedOrigin(request.headers().get("origin"))) {
+            return jsonResponse(403, mapOf("error", "origin not allowed"));
+        }
+        if (!"POST".equalsIgnoreCase(request.method())) {
+            HttpResponse response = jsonResponse(405, mapOf("error", "method not allowed"));
+            response.headers().put("Allow", "POST");
+            return response;
+        }
+        try {
+            JsonElement root = JsonParser.parseString(request.body());
+            String id = root.isJsonObject() ? stringValue(root.getAsJsonObject().get("providerId")) : null;
+            if (id == null || !id.matches(PROVIDER_ID_PATTERN)) {
+                return jsonResponse(400, mapOf("error", "valid providerId is required"));
+            }
+            RemoteProvider provider = remoteProviders.remove(id);
+            if (provider != null) {
+                provider.close();
+            }
+            return jsonResponse(200, mapOf("status", provider == null ? "not-found" : "unregistered"));
+        } catch (JsonParseException | IllegalStateException | UnsupportedOperationException e) {
+            return jsonResponse(400, mapOf("error", "invalid unregistration body"));
+        }
     }
 
     private HttpResponse handleDocs(HttpRequest request, String path) {
@@ -640,7 +1085,15 @@ public class McpServer {
         if (paramsElement != null && !paramsElement.isJsonNull() && !paramsElement.isJsonObject()) {
             throw new McpRpcException(-32602, "tools/list params must be an object");
         }
-        return mapOf("tools", toolProvider.listTools());
+        List<McpTool> tools = new ArrayList<>();
+        List<McpTool> localTools = toolProvider.listTools();
+        if (localTools != null) {
+            tools.addAll(localTools);
+        }
+        remoteProviders.values().stream()
+                .sorted(Comparator.comparing(provider -> provider.providerId))
+                .forEach(provider -> tools.addAll(provider.tools));
+        return mapOf("tools", tools);
     }
 
     private Map<String, Object> toolsCallResult(JsonElement paramsElement) throws McpRpcException {
@@ -661,7 +1114,10 @@ public class McpServer {
             }
         }
         try {
-            Object result = toolProvider.callTool(name, arguments);
+            RemoteProvider remoteProvider = findRemoteProvider(name);
+            Object result = remoteProvider == null
+                    ? toolProvider.callTool(name, arguments)
+                    : remoteProvider.callTool(name, arguments);
             return mapOf(
                     "content", List.of(mapOf("type", "text", "text", GSON.toJson(result))),
                     "structuredContent", result,
@@ -901,6 +1357,129 @@ public class McpServer {
         }
     }
 
+    private final class RemoteProvider {
+        private final String providerId;
+        private final String name;
+        private final String version;
+        private final List<McpTool> tools;
+        private final String channelToken;
+        private final Map<String, CompletableFuture<Object>> pending = new ConcurrentHashMap<>();
+        private volatile long lastHeartbeat = System.currentTimeMillis();
+        private volatile Socket socket;
+        private volatile BufferedWriter writer;
+
+        private RemoteProvider(String providerId, String name, String version, List<McpTool> tools,
+                               String channelToken) {
+            this.providerId = providerId;
+            this.name = name;
+            this.version = version;
+            this.tools = List.copyOf(tools);
+            this.channelToken = channelToken;
+        }
+
+        private synchronized void attach(Socket newSocket, InputStream input) throws IOException {
+            closeChannel();
+            newSocket.setSoTimeout(0);
+            socket = newSocket;
+            writer = new BufferedWriter(new OutputStreamWriter(newSocket.getOutputStream(), StandardCharsets.UTF_8));
+            lastHeartbeat = System.currentTimeMillis();
+            Thread reader = new Thread(() -> readLoop(newSocket, input), "MCP-provider-" + providerId);
+            reader.setDaemon(true);
+            reader.start();
+        }
+
+        private void readLoop(Socket channel, InputStream input) {
+            try {
+                String frame;
+                while ((frame = readProviderLine(input, MAX_PROVIDER_FRAME_BYTES)) != null) {
+                    JsonElement element = JsonParser.parseString(frame);
+                    if (!element.isJsonObject()) {
+                        continue;
+                    }
+                    JsonObject object = element.getAsJsonObject();
+                    lastHeartbeat = System.currentTimeMillis();
+                    String type = stringValue(object.get("type"));
+                    if ("heartbeat".equals(type)) {
+                        send(mapOf("type", "heartbeat_ack"));
+                    } else if ("pong".equals(type)) {
+                        // Host-to-client liveness probe acknowledgement.
+                    } else if ("result".equals(type) || "error".equals(type)) {
+                        String requestId = stringValue(object.get("requestId"));
+                        CompletableFuture<Object> future = requestId == null ? null : pending.remove(requestId);
+                        if (future != null) {
+                            if ("error".equals(type)) {
+                                future.completeExceptionally(new IOException(stringValue(object.get("error"))));
+                            } else {
+                                future.complete(object.has("result") ? jsonValue(object.get("result")) : null);
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) {
+                // The lease cleanup below removes disconnected providers.
+            } finally {
+                synchronized (this) {
+                    if (socket == channel) {
+                        closeChannel();
+                    }
+                }
+                remoteProviders.remove(providerId, this);
+                pending.values().forEach(future -> future.completeExceptionally(
+                        new IOException("provider channel disconnected")));
+                pending.clear();
+            }
+        }
+
+        private Object callTool(String name, Map<String, Object> arguments) throws Exception {
+            if (writer == null || socket == null || socket.isClosed()) {
+                throw new IOException("provider is disconnected: " + providerId);
+            }
+            String requestId = providerId + "-" + providerRequestSequence.incrementAndGet();
+            CompletableFuture<Object> future = new CompletableFuture<>();
+            pending.put(requestId, future);
+            try {
+                send(mapOf("type", "call", "requestId", requestId, "name", name,
+                        "arguments", arguments == null ? Map.of() : arguments));
+                return future.get(PROVIDER_CALL_TIMEOUT_MILLIS, TimeUnit.MILLISECONDS);
+            } finally {
+                pending.remove(requestId);
+            }
+        }
+
+        private synchronized void send(Map<String, Object> frame) {
+            if (writer == null) {
+                return;
+            }
+            try {
+                writer.write(GSON.toJson(frame));
+                writer.write('\n');
+                writer.flush();
+            } catch (IOException ignored) {
+                closeChannel();
+            }
+        }
+
+        private synchronized void close() {
+            closeChannel();
+            pending.values().forEach(future -> future.completeExceptionally(
+                    new IOException("provider channel closed")));
+            pending.clear();
+        }
+
+        private synchronized void closeChannel() {
+            Socket oldSocket = socket;
+            socket = null;
+            writer = null;
+            if (oldSocket != null) {
+                try {
+                    oldSocket.close();
+                } catch (IOException ignored) {
+                    // ignored
+                }
+            }
+        }
+    }
+
     private McpTool findTool(String name) {
         List<McpTool> tools = toolProvider.listTools();
         if (tools == null) {
@@ -909,6 +1488,22 @@ public class McpServer {
         for (McpTool tool : tools) {
             if (tool != null && name.equals(tool.getName())) {
                 return tool;
+            }
+        }
+        for (RemoteProvider provider : remoteProviders.values()) {
+            for (McpTool tool : provider.tools) {
+                if (tool != null && name.equals(tool.getName())) {
+                    return tool;
+                }
+            }
+        }
+        return null;
+    }
+
+    private RemoteProvider findRemoteProvider(String name) {
+        for (RemoteProvider provider : remoteProviders.values()) {
+            if (provider.tools.stream().anyMatch(tool -> tool != null && name.equals(tool.getName()))) {
+                return provider;
             }
         }
         return null;

@@ -1,20 +1,22 @@
 openapi: 3.1.0
 info:
   title: MCP Core HTTP JSON-RPC API
-  version: 1.0.1
+  version: 1.1.0
   description: |
-    Local MCP-style HTTP transport exposed by mcp-core. The server binds to
-    loopback by default and exposes JSON-RPC methods through /mcp. Start with
-    initialize, echo the returned Mcp-Session-Id and MCP-Protocol-Version on
-    later requests, then send notifications/initialized before using tools.
-    The default standalone provider exposes standalone.status and
-    standalone.echo; embedding applications can register their own tools.
+    Local MCP-style HTTP transport exposed by mcp-core. Exactly one instance
+    owns 127.0.0.1:8765 as the MCP host; other plugin instances register their
+    providers with that host and keep a heartbeat-backed provider channel.
+    Start with initialize, echo the returned Mcp-Session-Id and
+    MCP-Protocol-Version on later requests, then send notifications/initialized
+    before using tools. The default standalone provider exposes
+    standalone.status and standalone.echo.
 servers:
   - url: http://127.0.0.1:8765
-    description: Default local endpoint (the actual port may be 8765-8785)
+    description: Shared local endpoint. A fixed port avoids per-plugin client configuration.
 tags:
   - name: Health
   - name: MCP
+  - name: Host
 paths:
   /health:
     get:
@@ -72,7 +74,7 @@ paths:
                     capabilities: {}
                     clientInfo:
                       name: swagger-ui
-                      version: 1.0.0
+                      version: 1.1.0
               initialized:
                 summary: Acknowledge initialization
                 value:
@@ -155,6 +157,63 @@ paths:
           description: Preflight accepted
         '403':
           $ref: '#/components/responses/Forbidden'
+  /__mcp/providers/register:
+    post:
+      tags: [Host]
+      summary: Register a plugin provider with the shared host
+      description: |
+        Internal loopback-only endpoint used when another plugin already owns
+        port 8765. The response contains a short-lived channel token. The
+        registering plugin must then open a TCP connection to port 8765 and
+        send `MCP-PROVIDER/1 <providerId> <channelToken>` followed by newline-
+        delimited JSON frames. The channel carries tool calls and heartbeats.
+      operationId: registerProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProviderRegistration'
+      responses:
+        '200':
+          description: Provider registered; connect the provider channel immediately.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProviderRegistrationResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '409':
+          description: A tool name is already registered by another provider.
+        '503':
+          description: This instance is not currently the host.
+  /__mcp/providers/unregister:
+    post:
+      tags: [Host]
+      summary: Unregister a plugin provider
+      operationId: unregisterProvider
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [providerId]
+              properties:
+                providerId:
+                  type: string
+                  pattern: '^[A-Za-z0-9._~-]{1,128}$'
+      responses:
+        '200':
+          description: Provider removed or was already absent.
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '503':
+          description: This instance is not currently the host.
 components:
   parameters:
     ProtocolVersion:
@@ -233,7 +292,7 @@ components:
   schemas:
     HealthResponse:
       type: object
-      required: [status, endpoint]
+      required: [status, endpoint, role, providerId, providers]
       properties:
         status:
           type: string
@@ -241,6 +300,62 @@ components:
         endpoint:
           type: string
           format: uri
+        role:
+          type: string
+          enum: [host, client, stopped]
+        providerId:
+          type: string
+        providers:
+          type: integer
+          minimum: 0
+    ProviderRegistration:
+      type: object
+      required: [providerId, name, version, tools]
+      properties:
+        providerId:
+          type: string
+          pattern: '^[A-Za-z0-9._~-]{1,128}$'
+        name:
+          type: string
+          minLength: 1
+        version:
+          type: string
+          minLength: 1
+        tools:
+          type: array
+          items:
+            $ref: '#/components/schemas/Tool'
+    ProviderRegistrationResponse:
+      type: object
+      required: [status, providerId, channelToken, leaseSeconds, protocol]
+      properties:
+        status:
+          type: string
+          const: registered
+        providerId:
+          type: string
+        channelToken:
+          type: string
+        leaseSeconds:
+          type: integer
+          minimum: 1
+        protocol:
+          type: string
+          const: mcp-provider/1
+    Tool:
+      type: object
+      required: [name, inputSchema]
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        inputSchema:
+          type: object
+          additionalProperties: true
+        annotations:
+          type: object
+          additionalProperties: true
     JsonRpcRequest:
       type: object
       required: [jsonrpc, method]
