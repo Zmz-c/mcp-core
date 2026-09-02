@@ -1,0 +1,6 @@
+target/
+*.class
+*.log
+.idea/
+.DS_Store
+hs_err_pid*
