@@ -160,7 +160,7 @@ public class McpServer {
         StringBuilder header = new StringBuilder();
         header.append("HTTP/1.1 ").append(response.status()).append(" ").append(reasonPhrase(response.status()))
                 .append("\r\n");
-        header.append("Content-Type: application/json; charset=utf-8\r\n");
+        header.append("Content-Type: ").append(response.contentType()).append("\r\n");
         header.append("Content-Length: ").append(body.length).append("\r\n");
         header.append("Connection: close\r\n");
         header.append("Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n");
@@ -397,6 +397,9 @@ public class McpServer {
         if ("/health".equals(path)) {
             return handleHealth(request);
         }
+        if ("/docs".equals(path) || "/docs/".equals(path) || path.startsWith("/docs/")) {
+            return handleDocs(request, path);
+        }
         if ("/mcp".equals(path)) {
             return handleMcp(request);
         }
@@ -411,6 +414,59 @@ public class McpServer {
             return jsonResponse(405, mapOf("error", "method not allowed"));
         }
         return jsonResponse(200, mapOf("status", "ok", "endpoint", getEndpoint()));
+    }
+
+    private HttpResponse handleDocs(HttpRequest request, String path) {
+        if (!isAllowedOrigin(request.headers().get("origin"))) {
+            return jsonResponse(403, mapOf("error", "origin not allowed"));
+        }
+        if (!"GET".equalsIgnoreCase(request.method())) {
+            HttpResponse response = jsonResponse(405, mapOf("error", "method not allowed"));
+            response.headers().put("Allow", "GET");
+            return response;
+        }
+        String resourcePath = "/docs".equals(path) || "/docs/".equals(path)
+                ? "docs/index.html" : path.substring(1);
+        if (resourcePath.contains("..") || resourcePath.contains("\\") || resourcePath.contains("%")
+                || resourcePath.contains(":") || resourcePath.startsWith("/")) {
+            return jsonResponse(400, mapOf("error", "invalid documentation path"));
+        }
+        try (InputStream resource = McpServer.class.getClassLoader().getResourceAsStream(resourcePath)) {
+            if (resource == null) {
+                return jsonResponse(404, mapOf("error", "documentation resource not found"));
+            }
+            byte[] body = resource.readNBytes(MAX_BODY_BYTES + 1);
+            if (body.length > MAX_BODY_BYTES) {
+                return jsonResponse(413, mapOf("error", "documentation resource too large"));
+            }
+            return resourceResponse(body, resourceContentType(resourcePath));
+        } catch (IOException e) {
+            return jsonResponse(500, mapOf("error", "documentation resource unavailable"));
+        }
+    }
+
+    private static HttpResponse resourceResponse(byte[] body, String contentType) {
+        return new HttpResponse(200, body, new LinkedHashMap<>(), contentType);
+    }
+
+    private static String resourceContentType(String resourcePath) {
+        String lowerPath = resourcePath.toLowerCase(Locale.ROOT);
+        if (lowerPath.endsWith(".html")) {
+            return "text/html; charset=utf-8";
+        }
+        if (lowerPath.endsWith(".css")) {
+            return "text/css; charset=utf-8";
+        }
+        if (lowerPath.endsWith(".js")) {
+            return "application/javascript; charset=utf-8";
+        }
+        if (lowerPath.endsWith(".yaml") || lowerPath.endsWith(".yml")) {
+            return "text/yaml; charset=utf-8";
+        }
+        if (lowerPath.endsWith(".png")) {
+            return "image/png";
+        }
+        return "application/octet-stream";
     }
 
     private HttpResponse handleMcp(HttpRequest request) {
@@ -974,6 +1030,9 @@ public class McpServer {
     private record HttpRequest(String method, String path, Map<String, String> headers, String body) {
     }
 
-    private record HttpResponse(int status, byte[] body, Map<String, String> headers) {
+    private record HttpResponse(int status, byte[] body, Map<String, String> headers, String contentType) {
+        private HttpResponse(int status, byte[] body, Map<String, String> headers) {
+            this(status, body, headers, "application/json; charset=utf-8");
+        }
     }
 }

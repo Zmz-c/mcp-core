@@ -142,6 +142,23 @@ public class McpServerTest {
         assertEquals(400, mismatch.status());
     }
 
+    @Test
+    public void servesOfflineSwaggerUiAndRejectsTraversal() throws Exception {
+        HttpResult index = request("GET", "/docs/", Map.of(), "");
+        assertEquals(200, index.status());
+        assertTrue(index.header("content-type").startsWith("text/html"));
+        assertTrue(index.body().contains("Offline documentation"));
+        assertTrue(index.body().contains("swagger-ui-bundle.js"));
+
+        HttpResult specification = request("GET", "/docs/openapi.yaml", Map.of(), "");
+        assertEquals(200, specification.status());
+        assertTrue(specification.header("content-type").startsWith("text/yaml"));
+        assertTrue(specification.body().contains("openapi: 3.1.0"));
+
+        HttpResult traversal = request("GET", "/docs/../openapi.yaml", Map.of(), "");
+        assertEquals(400, traversal.status());
+    }
+
     private HttpResult request(String method, String path, Map<String, String> headers, String body) throws Exception {
         URI endpoint = URI.create(server.getEndpoint());
         try (Socket socket = new Socket(endpoint.getHost(), endpoint.getPort())) {
