@@ -43,10 +43,10 @@ Build the executable package from the repository root:
 .\mvnw.cmd package
 ```
 
-The output is `target/mcp-core-1.0.0-standalone.jar`. Run it with Java 21:
+The output is `target/mcp-core-1.0.1-standalone.jar`. Run it with Java 21:
 
 ```powershell
-java -jar target/mcp-core-1.0.0-standalone.jar
+java -jar target/mcp-core-1.0.1-standalone.jar
 ```
 
 The launcher binds to `127.0.0.1`, tries ports `8765` through `8785`, and exposes
@@ -57,12 +57,23 @@ constructor. To load one, put its jar beside the standalone package and launch
 with an explicit class path, for example on Windows:
 
 ```powershell
-java -cp "custom-provider.jar;target/mcp-core-1.0.0-standalone.jar" `
+java -cp "custom-provider.jar;target/mcp-core-1.0.1-standalone.jar" `
   burp.vaycore.mcp.McpStandaloneMain --provider-class com.example.MyProvider
 ```
 
 On Linux/macOS, use `:` instead of `;` in the class path.
 
-OpenAPI 3.1 documentation is provided in `openapi.yaml`. It can be opened in
-Swagger Editor or Swagger UI, with the server URL changed to the actual port
-shown by the launcher.
+## Offline Swagger UI
+
+The standalone server bundles Swagger UI, its CSS/JavaScript assets, and the
+OpenAPI document. No CDN, network connection, or external browser extension is
+needed. After starting the server, open the following local URL in a browser:
+
+```text
+http://127.0.0.1:<port>/docs/
+```
+
+The page loads the specification from `/docs/openapi.yaml` and lets you try
+the health and MCP endpoints against the running local server. The exact port
+is printed at startup (or is the value passed with `--port`). The raw OpenAPI
+3.1 document is also available as `openapi.yaml` in the repository.

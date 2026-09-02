@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: MCP Core HTTP JSON-RPC API
-  version: 1.0.0
+  version: 1.0.1
   description: |
     Local MCP-style HTTP transport exposed by mcp-core. The server binds to
     loopback by default and exposes JSON-RPC methods through /mcp. Start with

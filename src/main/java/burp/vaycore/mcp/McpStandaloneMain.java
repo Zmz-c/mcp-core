@@ -16,7 +16,7 @@ import java.util.concurrent.CountDownLatch;
 public final class McpStandaloneMain {
 
     private static final String DEFAULT_NAME = "mcp-core-standalone";
-    private static final String DEFAULT_VERSION = "1.0.0";
+    private static final String DEFAULT_VERSION = "1.0.1";
 
     private McpStandaloneMain() {
     }
