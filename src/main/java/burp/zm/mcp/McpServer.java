@@ -810,12 +810,16 @@ public class McpServer {
                     || version == null || version.isBlank() || toolsElement == null) {
                 return jsonResponse(400, mapOf("error", "providerId, name, version and tools are required"));
             }
+            RemoteProvider existing = remoteProviders.get(id);
             List<McpTool> tools = new ArrayList<>();
             Set<String> names = new HashSet<>();
             for (JsonElement toolElement : toolsElement) {
                 McpTool tool = GSON.fromJson(toolElement, McpTool.class);
                 if (tool == null || tool.getName() == null || tool.getName().isBlank()
-                        || !names.add(tool.getName()) || findTool(tool.getName()) != null) {
+                        || !names.add(tool.getName())
+                        || (findTool(tool.getName()) != null
+                        && (existing == null || existing.tools.stream().noneMatch(existingTool ->
+                        existingTool != null && tool.getName().equals(existingTool.getName()))))) {
                     return jsonResponse(409, mapOf("error", "provider tool name is missing or already registered"));
                 }
                 tools.add(tool);

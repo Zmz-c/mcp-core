@@ -16,7 +16,7 @@ McpToolProvider provider = new McpToolProvider() {
     }
 };
 
-McpServer server = new McpServer(provider, "my-plugin-mcp", "1.1.1");
+McpServer server = new McpServer(provider, "my-plugin-mcp", "1.1.2");
 server.start();
 // server.getEndpoint() -> http://127.0.0.1:<port>/mcp
 ```
@@ -43,10 +43,10 @@ Build the executable package from the repository root:
 .\mvnw.cmd package
 ```
 
-The output is `target/mcp-core-1.1.1-standalone.jar`. Run it with Java 21:
+The output is `target/mcp-core-1.1.2-standalone.jar`. Run it with Java 21:
 
 ```powershell
-java -jar target/mcp-core-1.1.1-standalone.jar
+java -jar target/mcp-core-1.1.2-standalone.jar
 ```
 
 The launcher uses the shared `127.0.0.1:8765` host port and exposes two
@@ -58,7 +58,7 @@ constructor. To load one, put its jar beside the standalone package and launch
 with an explicit class path, for example on Windows:
 
 ```powershell
-java -cp "custom-provider.jar;target/mcp-core-1.1.1-standalone.jar" `
+java -cp "custom-provider.jar;target/mcp-core-1.1.2-standalone.jar" `
   burp.zm.mcp.McpStandaloneMain --provider-class com.example.MyProvider
 ```
 

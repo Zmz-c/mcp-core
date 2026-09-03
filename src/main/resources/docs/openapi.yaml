@@ -1,7 +1,7 @@
 openapi: 3.1.0
 info:
   title: MCP Core HTTP JSON-RPC API
-  version: 1.1.1
+  version: 1.1.2
   description: |
     Local MCP-style HTTP transport exposed by mcp-core. Exactly one instance
     owns 127.0.0.1:8765 as the MCP host; other plugin instances register their
@@ -131,7 +131,7 @@ paths:
                     capabilities: {}
                     clientInfo:
                       name: swagger-ui
-                      version: 1.1.1
+                      version: 1.1.2
               initialized:
                 summary: Acknowledge initialization
                 value:
